@@ -572,3 +572,18 @@ func DecodePageIndex(r io.ByteReader, level int, minTXID, maxTXID TXID) (map[uin
 	}
 	return pageIndex, nil
 }
+
+// DecodePageIndexFunc decodes the page index from r like DecodePageIndex, but
+// calls fn for each entry, in ascending page order, instead of building a map.
+// A caller that holds a large index, such as a read-on-demand VFS over a
+// database-sized snapshot, can then keep the entries in a denser form than a
+// map with a PageIndexElem per page.
+//
+// It applies the same validation as DecodePageIndex, so the entries are
+// untrusted range metadata in the same way. The trailing size field is only
+// checked after the last entry, so fn may have seen every entry by the time
+// an error is returned: discard what fn collected if DecodePageIndexFunc
+// fails. If fn returns an error, decoding stops and that error is returned.
+func DecodePageIndexFunc(r io.ByteReader, fn func(pgno uint32, offset, size int64) error) error {
+	return parsePageIndex(r, nil, fn)
+}
