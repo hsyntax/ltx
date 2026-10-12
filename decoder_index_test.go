@@ -3,6 +3,8 @@ package ltx_test
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"hash/crc64"
 	"math"
 	"testing"
@@ -327,6 +329,125 @@ func TestDecoder_PageIndexStructure(t *testing.T) {
 		index = binary.BigEndian.AppendUint64(index, uint64(len(index)))
 		if _, err := ltx.DecodePageIndex(bytes.NewReader(index), 0, 1, 1); err == nil {
 			t.Fatal("expected DecodePageIndex to reject out-of-order entries")
+		}
+	})
+}
+
+// pageIndexBytes returns data's page index section: its records, end marker
+// and size field.
+func pageIndexBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	sizeStart := len(data) - ltx.TrailerSize - 8
+	indexSize := binary.BigEndian.Uint64(data[sizeStart:])
+	return data[sizeStart-int(indexSize) : sizeStart+8]
+}
+
+func TestDecodePageIndexFunc(t *testing.T) {
+	data := encodeIndexedFile(t, []uint32{2, 5, 9}, 16)
+	index := pageIndexBytes(t, data)
+
+	t.Run("MatchesDecodePageIndex", func(t *testing.T) {
+		want, err := ltx.DecodePageIndex(bytes.NewReader(index), 0, 2, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pgnos []uint32
+		if err := ltx.DecodePageIndexFunc(bytes.NewReader(index), func(pgno uint32, offset, size int64) error {
+			elem, ok := want[pgno]
+			if !ok {
+				t.Fatalf("page %d not in DecodePageIndex", pgno)
+			} else if offset != elem.Offset || size != elem.Size {
+				t.Fatalf("page %d: offset=%d size=%d, want offset=%d size=%d", pgno, offset, size, elem.Offset, elem.Size)
+			}
+			pgnos = append(pgnos, pgno)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := fmt.Sprint(pgnos), "[2 5 9]"; got != want {
+			t.Fatalf("pgnos=%s, want %s", got, want)
+		}
+	})
+
+	t.Run("CallbackErrorStopsDecoding", func(t *testing.T) {
+		errStop := errors.New("stop")
+		var n int
+		err := ltx.DecodePageIndexFunc(bytes.NewReader(index), func(uint32, int64, int64) error {
+			if n++; n == 2 {
+				return errStop
+			}
+			return nil
+		})
+		if !errors.Is(err, errStop) {
+			t.Fatalf("err=%v, want %v", err, errStop)
+		} else if n != 2 {
+			t.Fatalf("fn called %d times, want 2", n)
+		}
+	})
+
+	t.Run("OutOfOrderRejected", func(t *testing.T) {
+		var index []byte
+		for _, r := range [][3]uint64{{5, 100, 40}, {3, 140, 40}} {
+			index = binary.AppendUvarint(index, r[0])
+			index = binary.AppendUvarint(index, r[1])
+			index = binary.AppendUvarint(index, r[2])
+		}
+		index = binary.AppendUvarint(index, 0)
+		index = binary.BigEndian.AppendUint64(index, uint64(len(index)))
+		if err := ltx.DecodePageIndexFunc(bytes.NewReader(index), func(uint32, int64, int64) error { return nil }); err == nil {
+			t.Fatal("expected error for out-of-order entries")
+		}
+	})
+
+	// The size field follows the entries, so a mismatch is reported only after
+	// fn has seen all of them; callers must discard what they collected.
+	t.Run("SizeMismatchAfterEntries", func(t *testing.T) {
+		corrupt := bytes.Clone(index)
+		size := binary.BigEndian.Uint64(corrupt[len(corrupt)-8:])
+		binary.BigEndian.PutUint64(corrupt[len(corrupt)-8:], size+1)
+		var n int
+		if err := ltx.DecodePageIndexFunc(bytes.NewReader(corrupt), func(uint32, int64, int64) error { n++; return nil }); err == nil {
+			t.Fatal("expected error for page index size mismatch")
+		} else if n != 3 {
+			t.Fatalf("fn called %d times, want 3", n)
+		}
+	})
+}
+
+// BenchmarkDecodePageIndex decodes the index of a 1 GiB snapshot of 4 KiB
+// pages into a map, and through DecodePageIndexFunc into dense columns.
+func BenchmarkDecodePageIndex(b *testing.B) {
+	const pages = 1 << 18
+	var index []byte
+	for pgno := uint64(1); pgno <= pages; pgno++ {
+		index = binary.AppendUvarint(index, pgno)
+		index = binary.AppendUvarint(index, ltx.HeaderSize+(pgno-1)*4200)
+		index = binary.AppendUvarint(index, 4200)
+	}
+	index = binary.AppendUvarint(index, 0)
+	index = binary.BigEndian.AppendUint64(index, uint64(len(index)))
+
+	b.Run("Map", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := ltx.DecodePageIndex(bytes.NewReader(index), 0, 1, 1); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("Func", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var offsets []int64
+			var sizes []uint32
+			if err := ltx.DecodePageIndexFunc(bytes.NewReader(index), func(pgno uint32, offset, size int64) error {
+				offsets = append(offsets, offset)
+				sizes = append(sizes, uint32(size))
+				return nil
+			}); err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 }
